@@ -1,0 +1,8 @@
+VCC   :Voltage at the Collector atau bisa dibilang pin sumber tegangan positif untuk memberi daya agar modul bisa menyala dan bekerja.
+GND   :pin ground (negatif) yang menjadi jalur kembali arus dan referensi tegangan.
+CS    :pin untuk memilih dan mengaktifkan layar saat komunikasi SPI berlangsung.
+RESET :untuk mengulang sistem internal layar agar kembali ke kondisi awal.
+A0    :A0 pada LCD TFT adalah pin untuk memilih antara mode command (perintah) dan mode data(isi data yang akan ditampilkan).
+SDA   :Serial data atau bisa dibilang jalur untuk mengirim dan menerima data.
+SCK   :pin clock yang mengatur timing pengiriman data pada komunikasi SPI di TFT.
+LED   :menyalakan atau mengatur kecerahan lampu belakang layar.

@@ -1,0 +1,681 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <TFT_eSPI.h>
+#include <ArduinoJson.h>
+#include <math.h>
+
+#define MONITOR_BAUD      115200
+#define ECU_BAUD          57600
+#define SIMULATE          false
+#define KEEP_ALIVE_MS     6000
+#define ECU_TIMEOUT_MS    3000
+#define ECU_RETRY_MS      2000
+#define SEND_INTERVAL     500
+#define TFT_INTERVAL      500
+
+#define VSS_DEBOUNCE_DELAY  0.3
+
+// ========== LIMIT RPM ==========
+#define RPM_MAX           5500
+
+// ========== Palet Warna Tema RACING / F1 ==========
+#define C_BLACK     0x0000
+#define C_WHITE     0xFFFF
+#define C_RACE_RED  0xF800
+#define C_GREEN     0x07E0
+#define C_YELLOW    0xFFE0
+#define C_RED       0xF800
+#define C_GRAY      0x39C7
+#define C_PANEL     0x10A2
+#define C_PANEL2    0x0841
+#define C_HILITE    0x9E9F
+
+// ========== Ukuran layar 1.8" ST7735 landscape ==========
+#define SCREEN_W    160
+#define SCREEN_H    128
+#define SIDEBAR_X   124
+#define SIDEBAR_W   (SCREEN_W - SIDEBAR_X)
+
+// ========== PIN ==========
+const int IRSensorPin   = PB8;
+const int ThermistorPin = PA6;
+const int sensorAFR     = PA1;
+
+// ========== Serial ==========
+HardwareSerial ecuSerial(PA3, PA2);
+HardwareSerial SerialESP(PA10, PA9);
+
+// ========== TFT ==========
+TFT_eSPI tft = TFT_eSPI();
+
+// ========== Konstanta ==========
+const float R1 = 9400.0;
+const float c1 = 1.009249522e-03;
+const float c2 = 2.378405444e-04;
+const float c3 = 2.019202697e-07;
+
+// ========== KONSTANTA VSS PROTO KODE 1 ==========
+const double kkbanspd = 0.00039878;
+int raw_RPM_VSS = 0;
+
+// ========== Global ==========
+int   g_rpm  = 0;
+float g_tps  = 0.0;
+float g_vbat = 0.0;
+int   g_kecepatan = 0;
+float g_afr  = 0.0;
+int   g_suhu = 0;
+
+String currentLine = "";
+bool ecuConnected = false;
+unsigned long lastEcuData = 0;
+unsigned long lastPing = 0;
+
+// ========== VSS (speed asli) ==========
+int inputStateVSS = LOW;
+int lastInputStateVSS = LOW;
+unsigned long lastDebounceTimeVSS = 0;
+unsigned long endTimeVSS = 0;
+unsigned long startTimeVSS = 0;
+
+// ========== Buffer suhu ==========
+float suhuBuffer[10] = {0};
+int bufferIndex = 0;
+int bufferFilled = 0;
+
+// ========== Timing ==========
+unsigned long lastSend = 0;
+unsigned long lastTFTUpdate = 0;
+unsigned long packetCounter = 0;
+unsigned long startTime = 0;
+int lastMinutes = -1;
+int lastSeconds = -1;
+
+// ========== State tracker khusus TFT ==========
+int   lastSpeedDraw = -1;
+int   lastRpmDraw    = -1;
+int   lastTpsDraw    = -1;
+int   lastSuhuDraw   = -999;
+bool  lastEcuStateDraw = true;
+
+// ========== Simulasi khusus suhu (naik turun bertahap agar mudah diamati) ==========
+int   simSuhuArah = 1;
+
+// =====================================================
+// TFT - HELPER VISUAL
+// =====================================================
+
+uint16_t getBarColor(int x) {
+  if (x < 50) return C_GREEN;
+  if (x < 95) return C_YELLOW;
+  return C_RED;
+}
+
+// Garis motif "checkered flag" - ciri khas balap
+void drawCheckerLine(int x, int y, int w, int size, uint16_t colorA, uint16_t colorB) {
+  int n = w / size;
+  for (int i = 0; i < n; i++) {
+    uint16_t c = (i % 2 == 0) ? colorA : colorB;
+    tft.fillRect(x + i * size, y, size, size, c);
+  }
+}
+
+// =====================================================
+// TFT - LAYOUT STATIS
+// =====================================================
+
+void drawLayoutStatic() {
+
+  tft.fillScreen(C_BLACK);
+
+  tft.drawRect(0, 0, SCREEN_W, SCREEN_H, C_RACE_RED);
+  tft.drawRect(2, 2, SCREEN_W - 4, SCREEN_H - 4, C_GRAY);
+
+  drawCheckerLine(4, 12, 116, 3, C_WHITE, C_BLACK);
+
+  tft.fillRoundRect(4, 15, 116, 28, 3, C_PANEL2);
+  tft.drawRoundRect(4, 15, 116, 28, 3, C_RACE_RED);
+  tft.setTextColor(C_GRAY, C_PANEL2);
+  tft.setTextSize(1);
+  tft.setCursor(7, 17);
+  tft.print("RPM");
+
+  tft.fillRoundRect(4, 45, 92, 40, 5, C_PANEL);
+  tft.drawRoundRect(4, 45, 92, 40, 5, C_RACE_RED);
+  tft.setTextColor(C_GRAY, C_PANEL);
+  tft.setCursor(8, 47);
+  tft.print("SPEED");
+  tft.setTextColor(C_RACE_RED, C_PANEL);
+  tft.setCursor(68, 76);
+  tft.print("KM/H");
+
+  tft.fillRoundRect(4, 87, 116, 36, 4, C_PANEL);
+  tft.drawRoundRect(4, 87, 116, 36, 4, C_RACE_RED);
+  tft.setTextColor(C_WHITE, C_PANEL);
+  tft.setCursor(8, 90);
+  tft.print("THROTTLE");
+
+  tft.fillRoundRect(SIDEBAR_X, 15, SIDEBAR_W - 2, 108, 4, C_PANEL);
+  tft.drawRoundRect(SIDEBAR_X, 15, SIDEBAR_W - 2, 108, 4, C_RACE_RED);
+  tft.setTextColor(C_WHITE, C_PANEL);
+  tft.setCursor(SIDEBAR_X + 3, 18);
+  tft.print("TEMP");
+}
+
+// =====================================================
+// TFT - STATUS BAR
+// =====================================================
+
+void updateStatusBar() {
+
+  unsigned long s = (millis() - startTime) / 1000;
+
+  int minutes = (s / 60) % 60;
+  int seconds = s % 60;
+
+  if (minutes != lastMinutes || seconds != lastSeconds) {
+
+    lastMinutes = minutes;
+    lastSeconds = seconds;
+
+    tft.fillRect(4, 2, 40, 9, C_BLACK);
+    tft.setTextColor(C_WHITE, C_BLACK);
+    tft.setTextSize(1);
+
+    char buf[8];
+    sprintf(buf, "%02d:%02d", minutes, seconds);
+
+    tft.setCursor(4, 3);
+    tft.print(buf);
+  }
+
+  if (ecuConnected != lastEcuStateDraw) {
+
+    lastEcuStateDraw = ecuConnected;
+
+    tft.fillRect(75, 2, 45, 9, C_BLACK);
+    tft.setTextSize(1);
+
+    if (ecuConnected) {
+      tft.setTextColor(C_GREEN, C_BLACK);
+      tft.setCursor(75, 3);
+      tft.print("ECU:OK");
+    } else {
+      tft.setTextColor(C_RACE_RED, C_BLACK);
+      tft.setCursor(75, 3);
+      tft.print("ECU:--");
+    }
+  }
+}
+
+// =====================================================
+// TFT - RENDER DATA REALTIME
+// =====================================================
+
+void drawShiftLights(int rpm) {
+
+  const int numSeg = 12;
+  const int segW = 7, gap = 2, segH = 8, startX = 7, y = 25;
+
+  int activeSeg = map(constrain(rpm, 0, RPM_MAX), 0, RPM_MAX, 0, numSeg);
+
+  for (int i = 0; i < numSeg; i++) {
+
+    bool on = (i < activeSeg);
+    uint16_t col;
+
+    if (i < 5)      col = C_GREEN;
+    else if (i < 9) col = C_YELLOW;
+    else            col = C_RED;
+
+    int x = startX + i * (segW + gap);
+
+    if (on) {
+      tft.fillRoundRect(x, y, segW, segH, 1, col);
+      tft.drawFastHLine(x + 1, y + 1, segW - 2, C_HILITE);
+    } else {
+      tft.fillRoundRect(x, y, segW, segH, 1, C_PANEL);
+      tft.drawRoundRect(x, y, segW, segH, 1, C_GRAY);
+    }
+  }
+}
+
+void drawTempBar(int temp) {
+
+  const int numSeg = 10;
+  const int segH = 6, gap = 1, segW = 14;
+  const int baseY = 113;
+  const int baseX = SIDEBAR_X + 7;
+
+  int filledSeg = map(constrain(temp, 40, 120), 40, 120, 0, numSeg);
+
+  for (int i = 0; i < numSeg; i++) {
+
+    bool on = (i < filledSeg);
+    uint16_t col;
+
+    if (i < 5)      col = C_GREEN;
+    else if (i < 8) col = C_YELLOW;
+    else            col = C_RED;
+
+    int y = baseY - i * (segH + gap);
+
+    if (on) {
+      tft.fillRect(baseX, y - segH + 1, segW, segH, col);
+    } else {
+      tft.fillRect(baseX, y - segH + 1, segW, segH, C_PANEL);
+      tft.drawRect(baseX, y - segH + 1, segW, segH, C_GRAY);
+    }
+  }
+}
+
+void drawTpsBar(int tps) {
+
+  const int numSeg = 20;
+  const int segW = 4, gap = 1, segH = 12;
+  const int baseX = 8, baseY = 108;
+
+  int activeSeg = map(constrain(tps, 0, 100), 0, 100, 0, numSeg);
+
+  for (int i = 0; i < numSeg; i++) {
+
+    bool on = (i < activeSeg);
+    uint16_t col;
+
+    if (i < 11)      col = C_GREEN;
+    else if (i < 17) col = C_YELLOW;
+    else             col = C_RED;
+
+    if (on) {
+      tft.fillRect(baseX + i * (segW + gap), baseY, segW, segH, col);
+    } else {
+      tft.fillRect(baseX + i * (segW + gap), baseY, segW, segH, C_PANEL2);
+      tft.drawRect(baseX + i * (segW + gap), baseY, segW, segH, C_GRAY);
+    }
+  }
+}
+
+void updateTFT() {
+
+  updateStatusBar();
+
+  // ---------- SPEED (hero panel) ----------
+  if (g_kecepatan != lastSpeedDraw) {
+
+    lastSpeedDraw = g_kecepatan;
+
+    tft.fillRect(8, 55, 60, 24, C_PANEL);
+
+    tft.setTextSize(3);
+    tft.setTextColor(C_WHITE, C_PANEL);
+
+    if (g_kecepatan < 10)
+      tft.setCursor(30, 56);
+    else if (g_kecepatan < 100)
+      tft.setCursor(20, 56);
+    else
+      tft.setCursor(10, 56);
+
+    tft.print(g_kecepatan);
+  }
+
+  // ---------- SHIFT-LIGHT + RPM digital ----------
+  if (g_rpm != lastRpmDraw) {
+
+    lastRpmDraw = g_rpm;
+
+    drawShiftLights(g_rpm);
+
+    tft.fillRect(4, 35, 116, 8, C_PANEL2);
+    tft.setTextSize(1);
+    tft.setTextColor(C_WHITE, C_PANEL2);
+    tft.setCursor(7, 35);
+    tft.print(g_rpm);
+    tft.print(" RPM");
+  }
+
+  // ---------- TPS (bar segmented + angka) ----------
+  if ((int)g_tps != lastTpsDraw) {
+
+    lastTpsDraw = (int)g_tps;
+
+    drawTpsBar((int)g_tps);
+
+    tft.fillRect(88, 90, 30, 9, C_PANEL);
+    tft.setTextSize(1);
+    tft.setTextColor(C_WHITE, C_PANEL);
+    tft.setCursor(88, 90);
+    tft.print((int)g_tps);
+    tft.print("%");
+  }
+
+  // ---------- SUHU (sidebar) - angka selalu putih ----------
+  if (g_suhu != lastSuhuDraw) {
+
+    lastSuhuDraw = g_suhu;
+
+    drawTempBar(g_suhu);
+
+    bool suhuValid = (g_suhu > -40 && g_suhu < 150);
+
+    tft.fillRect(SIDEBAR_X + 1, 30, SIDEBAR_W - 4, 10, C_PANEL);
+    tft.setTextSize(1);
+    tft.setTextColor(C_WHITE, C_PANEL);
+    tft.setCursor(SIDEBAR_X + 3, 30);
+    if (suhuValid) {
+      tft.print(g_suhu);
+      tft.print("C");
+    } else {
+      tft.print("ERR");
+    }
+  }
+}
+
+// =====================================================
+// ECU
+// =====================================================
+
+void sendCmd(const char* cmd) {
+  ecuSerial.print(cmd);
+  ecuSerial.println();
+  ecuSerial.flush();
+}
+
+String getField(const String &s, int fieldNum) {
+  int start = 0;
+  for (int i = 0; i < fieldNum; i++) {
+    start = s.indexOf(';', start);
+    if (start == -1) return "";
+    start++;
+  }
+  int end = s.indexOf(';', start);
+  if (end == -1) end = s.length();
+  String field = s.substring(start, end);
+  field.trim();
+  return field;
+}
+
+String cleanString(const String &s) {
+  String out = "";
+  out.reserve(s.length());
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s.charAt(i);
+    if (c >= 32 && c <= 126) out += c;
+  }
+  return out;
+}
+
+bool isNumeric(const String &s) {
+  if (s.length() == 0) return false;
+  int start = 0;
+  if (s.charAt(0) == '-') start = 1;
+  bool hasDot = false;
+  for (int i = start; i < (int)s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '.') {
+      if (hasDot) return false;
+      hasDot = true;
+    } else if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+float parseFloat(const String &s, float defaultVal, float minVal, float maxVal) {
+  if (!isNumeric(s)) return defaultVal;
+  float val = s.toFloat();
+  if (val < minVal || val > maxVal) return defaultVal;
+  return val;
+}
+
+int parseInt(const String &s, int defaultVal, int minVal, int maxVal) {
+  if (!isNumeric(s)) return defaultVal;
+  int val = s.toInt();
+  if (val < minVal || val > maxVal) return defaultVal;
+  return val;
+}
+
+void parseECU(const String &rawLine) {
+  String line = cleanString(rawLine);
+  if (line.length() < 10) return;
+  if (line.indexOf(';') == -1) return;
+  String lineLower = line;
+  lineLower.toLowerCase();
+  int headerIdx = lineLower.indexOf("a603;");
+  if (headerIdx == -1) return;
+  String data = line.substring(headerIdx);
+  int fieldCount = 1;
+  for (int i = 0; i < (int)data.length(); i++) {
+    if (data.charAt(i) == ';') fieldCount++;
+  }
+  if (fieldCount < 5) return;
+  String fTPS  = getField(data, 1);
+  String fVBAT = getField(data, 2);
+  String fRPM  = getField(data, 4);
+  float newTPS  = parseFloat(fTPS, g_tps, 0.0, 100.0);
+  float newVBAT = parseFloat(fVBAT, g_vbat, 6.0, 20.0);
+  int newRPM    = parseInt(fRPM, g_rpm, 0, RPM_MAX);
+  if (ecuConnected && abs(newRPM - g_rpm) > 8000) return;
+  g_tps  = newTPS;
+  g_vbat = newVBAT;
+  g_rpm  = newRPM;
+  ecuConnected = true;
+  lastEcuData = millis();
+}
+
+void handshakeECU() {
+  sendCmd("1B00");
+  delay(150);
+  while (ecuSerial.available()) ecuSerial.read();
+  sendCmd("1617");
+  delay(200);
+  while (ecuSerial.available()) {
+    char c = ecuSerial.read();
+    if (c == '\n') {
+      currentLine = "";
+      break;
+    } else if (c != '\r') {
+      currentLine += c;
+    }
+  }
+  currentLine = "";
+  sendCmd("160A");
+  delay(50);
+  lastPing = millis();
+  lastEcuData = millis();
+}
+
+// =====================================================
+// Sensor
+// =====================================================
+
+void bacaSuhu() {
+  const int N = 20;
+  long sum = 0;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(ThermistorPin);
+    delay(2);
+  }
+  float Vo = sum / (float)N;
+  float logR2 = log(R1 * (4095.0 / (float)Vo - 1.0));
+  float T = 1.0 / (c1 + c2 * logR2 + c3 * logR2 * logR2 * logR2);
+  float mentah = T - 273.15;
+  suhuBuffer[bufferIndex++] = mentah;
+  if (bufferIndex >= 10) {
+    bufferIndex = 0;
+    bufferFilled = 1;
+  }
+  int samples = bufferFilled ? 10 : (bufferIndex == 0 ? 1 : bufferIndex);
+  float sum2 = 0;
+  for (int i = 0; i < samples; i++) sum2 += suhuBuffer[i];
+  g_suhu = round(sum2 / samples);
+}
+
+void bacaAFR() {
+  const int N = 10;
+  long sum = 0;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(sensorAFR);
+    delayMicroseconds(100);
+  }
+  float volt = (sum / (float)N) * (3.3 / 4095.0);
+  float afr_bensin = 2.375 * volt + 7.3125;
+  float lamda = afr_bensin / 14.7;
+  g_afr = round(lamda * 9.12 * 100) / 100.0;
+}
+
+// =====================================================
+// JSON
+// =====================================================
+
+void kirimJSON() {
+  unsigned long detik_total = millis() / 1000;
+  int menit = detik_total / 60;
+  int detik = detik_total % 60;
+  StaticJsonDocument<256> doc;
+  doc["rpm"] = g_rpm;
+  doc["tps"] = (int)g_tps;
+  doc["vbat"] = g_vbat;
+  doc["kecepatan"] = g_kecepatan;
+  doc["afr"] = g_afr;
+  doc["suhu"] = g_suhu;
+  doc["ecu_connected"] = ecuConnected;
+  doc["packet"] = packetCounter++;
+  JsonObject waktu = doc.createNestedObject("waktu");
+  waktu["menit"] = menit;
+  waktu["detik"] = detik;
+  String output;
+  serializeJson(doc, output);
+  SerialESP.println(output);
+  raw_RPM_VSS = 0;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+  SerialESP.begin(9600);
+  pinMode(IRSensorPin, INPUT);
+  pinMode(sensorAFR, INPUT);
+  analogReadResolution(12);
+  pinMode(LED_BUILTIN, OUTPUT);
+  tft.init();
+  tft.setRotation(1);
+  drawLayoutStatic();
+  startTime = millis();
+  if (SIMULATE) {
+    randomSeed(analogRead(PA4));
+    g_suhu = 60;       // mulai dari 60C biar kelihatan naik pelan sampai lewat 105
+    lastSend = millis();
+    return;
+  }
+  ecuSerial.begin(ECU_BAUD);
+  delay(800);
+  handshakeECU();
+  lastSend = millis();
+  lastTFTUpdate = millis();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+  unsigned long now = millis();
+
+  if (SIMULATE) {
+    if (now - lastSend >= SEND_INTERVAL) {
+
+      // Hanya suhu yang dibuat naik-turun bertahap agar mudah diamati
+      // melewati ambang 95C dan 105C. Data lain tetap random seperti biasa.
+      g_suhu += simSuhuArah;
+      if (g_suhu >= 115) simSuhuArah = -1;
+      if (g_suhu <= 60)  simSuhuArah = 1;
+
+      g_rpm = random(1200, RPM_MAX);
+      g_tps = random(0, 100);
+      g_vbat = random(120, 145) / 10.0;
+      g_kecepatan = random(0, 60);
+      g_afr = random(800, 1500) / 100.0;
+
+      ecuConnected = true;
+      updateTFT();
+      kirimJSON();
+      lastSend = now;
+    }
+    updateTFT();
+    delay(10);
+    return;
+  }
+
+  // ---- VSS speed asli ----
+  bool vssPinNow = digitalRead(IRSensorPin);
+  int currentSwitchState = vssPinNow;
+  if (currentSwitchState != lastInputStateVSS) {
+    lastDebounceTimeVSS = now;
+  }
+  if ((now - lastDebounceTimeVSS) > VSS_DEBOUNCE_DELAY) {
+    if (currentSwitchState != inputStateVSS) {
+      inputStateVSS = currentSwitchState;
+      if (inputStateVSS == HIGH) {
+        startTimeVSS = lastDebounceTimeVSS;
+        if ((startTimeVSS - endTimeVSS) > 0) {
+          raw_RPM_VSS = 60000 / (startTimeVSS - endTimeVSS);
+          g_kecepatan = (int)((raw_RPM_VSS * kkbanspd) * 60);
+        }
+        endTimeVSS = startTimeVSS;
+      }
+    }
+  }
+  lastInputStateVSS = currentSwitchState;
+
+  // ---- ECU asli ----
+  if (ecuConnected && (now - lastEcuData > ECU_TIMEOUT_MS)) {
+    ecuConnected = false;
+    g_rpm = 0;
+    g_tps = 0;
+    g_vbat = 0;
+  }
+
+  if (!ecuConnected && (now - lastPing >= ECU_RETRY_MS)) {
+    handshakeECU();
+  }
+
+  if (ecuConnected && (now - lastPing >= KEEP_ALIVE_MS)) {
+    sendCmd("1B00");
+    lastPing = now;
+  }
+
+  while (ecuSerial.available()) {
+    char c = ecuSerial.read();
+    if (c == '\n' || c == '\r') {
+      if (currentLine.length() > 5) {
+        parseECU(currentLine);
+        currentLine = "";
+      }
+    } else {
+      currentLine += c;
+      if (currentLine.length() > 80) {
+        parseECU(currentLine);
+        currentLine = "";
+      }
+    }
+  }
+
+  if (now - lastSend >= SEND_INTERVAL) {
+    bacaSuhu();
+    bacaAFR();
+    kirimJSON();
+    lastSend = now;
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  }
+
+  if (now - lastTFTUpdate >= TFT_INTERVAL) {
+    updateTFT();
+    lastTFTUpdate = now;
+  }
+
+  delay(1);
+}
